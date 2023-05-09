@@ -1,281 +1,148 @@
-use std::{convert::From, fmt};
+use super::{
+    body::Body,
+    headers::{headers_from_js, headers_to_js},
+};
 
-use crate::{js_to_error, Error};
-use js_sys::{ArrayBuffer, Uint8Array};
-use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::JsFuture;
-use web_sys::ResponseInit;
+/// ResponseInit "caches" the data used to initialize a [`web_sys::Response].
+///
+/// It implements [`From<ResponseInit>`] to allow for easy conversion to [`web_sys::ResponseInit`].
+#[derive(Debug)]
+struct ResponseInit {
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) status_code: http::StatusCode,
+    pub(crate) status_text: String,
+}
 
-use crate::http::Headers;
-#[cfg(feature = "json")]
-#[cfg_attr(docsrs, doc(cfg(feature = "json")))]
-use serde::de::DeserializeOwned;
+impl From<ResponseInit> for web_sys::ResponseInit {
+    fn from(value: ResponseInit) -> Self {
+        let mut init = web_sys::ResponseInit::new();
 
-/// The [`Request`]'s response
-pub struct Response(web_sys::Response);
+        init.headers(&headers_to_js(&value.headers));
+        init.status(value.status_code.as_u16());
+        init.status_text(&value.status_text);
 
-impl Response {
-    /// Returns an instance of response builder
-    pub fn builder() -> ResponseBuilder {
-        ResponseBuilder::new()
-    }
-    /// The type read-only property of the Response interface contains the type of the response.
-    ///
-    /// It can be one of the following:
-    ///
-    ///  - basic: Normal, same origin response, with all headers exposed except “Set-Cookie” and
-    ///    “Set-Cookie2″.
-    ///  - cors: Response was received from a valid cross-origin request. Certain headers and the
-    ///    body may be accessed.
-    ///  - error: Network error. No useful information describing the error is available. The
-    ///    Response’s status is 0, headers are empty and immutable. This is the type for a Response
-    ///    obtained from Response.error().
-    ///  - opaque: Response for “no-cors” request to cross-origin resource. Severely restricted.
-    ///  - opaqueredirect: The fetch request was made with redirect: "manual". The Response's
-    ///    status is 0, headers are empty, body is null and trailer is empty.
-    pub fn type_(&self) -> web_sys::ResponseType {
-        self.0.type_()
-    }
-
-    /// The URL of the response.
-    ///
-    /// The returned value will be the final URL obtained after any redirects.
-    pub fn url(&self) -> String {
-        self.0.url()
-    }
-
-    /// Whether or not this response is the result of a request you made which was redirected.
-    pub fn redirected(&self) -> bool {
-        self.0.redirected()
-    }
-
-    /// the [HTTP status code](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status) of the
-    /// response.
-    pub fn status(&self) -> u16 {
-        self.0.status()
-    }
-
-    /// Whether the [HTTP status code](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status)
-    /// was a success code (in the range `200 - 299`).
-    pub fn ok(&self) -> bool {
-        self.0.ok()
-    }
-
-    /// The status message corresponding to the
-    /// [HTTP status code](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status) from
-    /// `Response::status`.
-    ///
-    /// For example, this would be 'OK' for a status code 200, 'Continue' for 100, or 'Not Found'
-    /// for 404.
-    pub fn status_text(&self) -> String {
-        self.0.status_text()
-    }
-
-    /// Gets the headers.
-    pub fn headers(&self) -> Headers {
-        Headers::from_raw(self.0.headers())
-    }
-
-    /// Has the response body been consumed?
-    ///
-    /// If true, then any future attempts to consume the body will error.
-    pub fn body_used(&self) -> bool {
-        self.0.body_used()
-    }
-
-    /// Gets the body.
-    pub fn body(&self) -> Option<web_sys::ReadableStream> {
-        self.0.body()
-    }
-
-    /// Reads the response to completion, returning it as `FormData`.
-    pub async fn form_data(&self) -> Result<web_sys::FormData, Error> {
-        let promise = self.0.form_data().map_err(js_to_error)?;
-        let val = JsFuture::from(promise).await.map_err(js_to_error)?;
-        Ok(web_sys::FormData::from(val))
-    }
-
-    /// Reads the response to completion, parsing it as JSON.
-    #[cfg(feature = "json")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
-    pub async fn json<T: DeserializeOwned>(&self) -> Result<T, Error> {
-        serde_json::from_str::<T>(&self.text().await?).map_err(Error::from)
-    }
-
-    /// Reads the response as a String.
-    pub async fn text(&self) -> Result<String, Error> {
-        let promise = self.0.text().unwrap();
-        let val = JsFuture::from(promise).await.map_err(js_to_error)?;
-        let string = js_sys::JsString::from(val);
-        Ok(String::from(&string))
-    }
-
-    /// Gets the binary response
-    ///
-    /// This works by obtaining the response as an `ArrayBuffer`, creating a `Uint8Array` from it
-    /// and then converting it to `Vec<u8>`
-    pub async fn binary(&self) -> Result<Vec<u8>, Error> {
-        let promise = self.0.array_buffer().map_err(js_to_error)?;
-        let array_buffer: ArrayBuffer = JsFuture::from(promise)
-            .await
-            .map_err(js_to_error)?
-            .unchecked_into();
-        let typed_buff: Uint8Array = Uint8Array::new(&array_buffer);
-        let mut body = vec![0; typed_buff.length() as usize];
-        typed_buff.copy_to(&mut body);
-        Ok(body)
+        init
     }
 }
 
-impl From<web_sys::Response> for Response {
-    fn from(raw: web_sys::Response) -> Self {
-        Self(raw)
-    }
-}
-
-impl From<Response> for web_sys::Response {
-    fn from(res: Response) -> Self {
-        res.0
-    }
-}
-
-impl fmt::Debug for Response {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Response")
-            .field("url", &self.url())
-            .field("redirected", &self.redirected())
-            .field("status", &self.status())
-            .field("headers", &self.headers())
-            .field("body_used", &self.body_used())
-            .finish_non_exhaustive()
-    }
-}
-
-/// A writable wrapper around `web_sys::Reponse`: an http response to be used with the `fetch` API
-/// on a server side javascript runtime
+/// A convenient builder for [`Response`].
+#[derive(Debug)]
+#[must_use = "ResponseBuilder does nothing unless you call `build`"]
 pub struct ResponseBuilder {
-    headers: Headers,
-    options: web_sys::ResponseInit,
+    body: Option<Body>,
+    init: ResponseInit,
+}
+
+/// A wrapper around [`web_sys::Response`].
+#[derive(Debug)]
+pub struct Response {
+    body: Option<Body>,
+    init: ResponseInit,
 }
 
 impl ResponseBuilder {
-    /// Creates a new response object which defaults to status 200
-    /// for other status codes, call Self.status(400)
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Replace _all_ the headers.
-    pub fn headers(mut self, headers: Headers) -> Self {
-        self.headers = headers;
-        self
-    }
-
-    /// Sets a header.
-    pub fn header(self, key: &str, value: &str) -> Self {
-        self.headers.set(key, value);
-        self
-    }
-
-    /// Set the status code
-    pub fn status(mut self, status: u16) -> Self {
-        self.options.status(status);
-        self
-    }
-
-    /// Set the status text
-    pub fn status_text(mut self, status_text: &str) -> Self {
-        self.options.status_text(status_text);
-        self
-    }
-
-    /// A convenience method to set JSON as response body
-    ///
-    /// # Note
-    ///
-    /// This method also sets the `Content-Type` header to `application/json`
-    #[cfg(feature = "json")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
-    pub fn json<T: serde::Serialize + ?Sized>(self, value: &T) -> Result<Response, Error> {
-        let json = serde_json::to_string(value)?;
-        self.header("Content-Type", "application/json")
-            .body(Some(json.as_str()))
-    }
-
-    /// Set the response body and return the response
-    pub fn body<T>(mut self, data: T) -> Result<Response, Error>
-    where
-        T: IntoRawResponse,
-    {
-        self.options.headers(&self.headers.into_raw());
-        let init = self.options;
-
-        data.into_raw(init).map(Response).map_err(js_to_error)
-    }
-}
-
-impl IntoRawResponse for Option<&web_sys::Blob> {
-    fn into_raw(self, init: ResponseInit) -> Result<web_sys::Response, JsValue> {
-        web_sys::Response::new_with_opt_blob_and_init(self, &init)
-    }
-}
-
-impl IntoRawResponse for Option<&js_sys::Object> {
-    fn into_raw(self, init: ResponseInit) -> Result<web_sys::Response, JsValue> {
-        web_sys::Response::new_with_opt_buffer_source_and_init(self, &init)
-    }
-}
-
-impl IntoRawResponse for Option<&mut [u8]> {
-    fn into_raw(self, init: ResponseInit) -> Result<web_sys::Response, JsValue> {
-        web_sys::Response::new_with_opt_u8_array_and_init(self, &init)
-    }
-}
-
-impl IntoRawResponse for Option<&web_sys::FormData> {
-    fn into_raw(self, init: ResponseInit) -> Result<web_sys::Response, JsValue> {
-        web_sys::Response::new_with_opt_form_data_and_init(self, &init)
-    }
-}
-
-impl IntoRawResponse for Option<&web_sys::UrlSearchParams> {
-    fn into_raw(self, init: ResponseInit) -> Result<web_sys::Response, JsValue> {
-        web_sys::Response::new_with_opt_url_search_params_and_init(self, &init)
-    }
-}
-
-impl IntoRawResponse for Option<&str> {
-    fn into_raw(self, init: ResponseInit) -> Result<web_sys::Response, JsValue> {
-        web_sys::Response::new_with_opt_str_and_init(self, &init)
-    }
-}
-
-impl IntoRawResponse for Option<&web_sys::ReadableStream> {
-    fn into_raw(self, init: ResponseInit) -> Result<web_sys::Response, JsValue> {
-        web_sys::Response::new_with_opt_readable_stream_and_init(self, &init)
-    }
-}
-
-/// trait which allow consuming self into a raw web_sys::Response
-pub trait IntoRawResponse {
-    /// A method which converts `self` and a [`web_sys::ResponseInit`] into a result to a
-    /// [`web_sys::Response`].
-    fn into_raw(self, init: ResponseInit) -> Result<web_sys::Response, JsValue>;
-}
-
-impl Default for ResponseBuilder {
-    fn default() -> Self {
+    /// Creates a new [`ResponseBuilder`] with a [`http::StatusCode`].
+    pub fn new(status_code: http::StatusCode) -> Self {
         Self {
-            headers: Headers::new(),
-            options: web_sys::ResponseInit::new(),
+            body: None,
+            init: ResponseInit {
+                headers: http::HeaderMap::new(),
+                status_code,
+                status_text: String::new(),
+            },
+        }
+    }
+
+    /// Sets the [`http::StatusCode`] of the [`Response`].
+    pub fn status(mut self, status_code: http::StatusCode) -> Self {
+        self.init.status_code = status_code;
+        self
+    }
+
+    /// Sets the status text of the [`Response`].
+    pub fn status_text(mut self, status_text: impl Into<String>) -> Self {
+        self.init.status_text = status_text.into();
+        self
+    }
+
+    /// Sets the [`http::HeaderMap`] of the [`Response`].
+    pub fn headers(mut self, headers: http::HeaderMap) -> Self {
+        self.init.headers = headers;
+        self
+    }
+
+    /// Consumes the [`ResponseBuilder`] and returns a [`Response`].
+    pub fn build(self) -> Response {
+        Response {
+            body: self.body,
+            init: self.init,
         }
     }
 }
 
-impl fmt::Debug for ResponseBuilder {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ResponseBuilder")
-            .field("headers", &self.headers)
-            .finish_non_exhaustive()
+impl Response {
+    /// Creates a new [`Response`] from a [`web_sys::Response`].
+    pub fn from_raw(response: web_sys::Response) -> Self {
+        response.into()
+    }
+
+    /// Creates a new [`web_sys::Response`] from a [`Response`].
+    pub fn into_raw(self) -> web_sys::Response {
+        self.into()
+    }
+
+    /// Creates a new [`ResponseBuilder`] with a [`http::StatusCode`].
+    pub fn builder(status_code: http::StatusCode) -> ResponseBuilder {
+        ResponseBuilder::new(status_code)
+    }
+
+    /// Returns the [`Body`] of the [`Response`].
+    pub fn body(&self) -> Option<&Body> {
+        self.body.as_ref()
+    }
+
+    /// Returns the [`http::HeaderMap`] of the [`Response`].
+    pub fn headers(&self) -> &http::HeaderMap {
+        &self.init.headers
+    }
+
+    /// Returns the [`http::StatusCode`] of the [`Response`].
+    pub fn status_code(&self) -> http::StatusCode {
+        self.init.status_code
+    }
+
+    /// Returns the status text of the [`Response`].
+    pub fn status_text(&self) -> &str {
+        &self.init.status_text
+    }
+}
+
+impl From<Response> for web_sys::Response {
+    fn from(value: Response) -> Self {
+        let init: web_sys::ResponseInit = value.init.into();
+
+        match value.body {
+            None => web_sys::Response::new_with_opt_readable_stream_and_init(None, &init),
+            Some(Body::ReadableStream(stream)) => {
+                web_sys::Response::new_with_opt_readable_stream_and_init(Some(&stream), &init)
+            }
+            Some(Body::Text(string)) => {
+                web_sys::Response::new_with_opt_str_and_init(Some(&string), &init)
+            }
+        }
+        .unwrap()
+    }
+}
+
+impl From<web_sys::Response> for Response {
+    fn from(value: web_sys::Response) -> Self {
+        Response {
+            body: value.body().map(Body::from),
+            init: ResponseInit {
+                headers: headers_from_js(value.headers()),
+                status_code: http::StatusCode::from_u16(value.status()).unwrap(),
+                status_text: value.status_text(),
+            },
+        }
     }
 }

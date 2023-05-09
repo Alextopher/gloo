@@ -1,368 +1,428 @@
-use crate::http::{Headers, QueryParams, Response};
+use std::convert::TryInto;
+
+use http::{header::InvalidHeaderValue, HeaderName, HeaderValue};
+use url::Url;
+use wasm_bindgen::JsCast;
+use web_sys::RequestCache;
+
 use crate::{js_to_error, Error};
-use http::Method;
-use js_sys::{ArrayBuffer, Reflect, Uint8Array};
-use std::convert::{From, TryFrom, TryInto};
-use std::fmt;
-use std::str::FromStr;
-use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::JsFuture;
-use web_sys::{
-    AbortSignal, FormData, ObserverCallback, ReadableStream, ReferrerPolicy, RequestCache,
-    RequestCredentials, RequestMode, RequestRedirect,
+
+use super::{
+    body::Body,
+    headers::{headers_from_js, headers_to_js},
+    Response,
 };
 
-#[cfg(feature = "json")]
-#[cfg_attr(docsrs, doc(cfg(feature = "json")))]
-use serde::de::DeserializeOwned;
+/// RequestInit caches the data used to initialize a [`web_sys::Request`].
+///
+/// It implements [`From<RequestInit>`] to allow for easy conversion to [`web_sys::RequestInit`].
+#[derive(Debug)]
+struct RequestInit {
+    method: http::Method,
+    headers: http::HeaderMap,
+    body: Option<Body>,
+    cache: web_sys::RequestCache,
+    credentials: web_sys::RequestCredentials,
+    integrity: String,
+    mode: web_sys::RequestMode,
+    redirect: web_sys::RequestRedirect,
+    referrer: String,
+    referrer_policy: web_sys::ReferrerPolicy,
+    // pub(crate) signal: Option<&'a web_sys::AbortSignal>,
+}
 
-/// A wrapper round `web_sys::Request`: an http request to be used with the `fetch` API.
+impl From<RequestInit> for web_sys::RequestInit {
+    fn from(value: RequestInit) -> Self {
+        let mut init = web_sys::RequestInit::new();
+
+        init.method(value.method.as_str());
+        init.headers(&headers_to_js(&value.headers));
+        init.body(value.body.map(Into::into).as_ref());
+        init.cache(value.cache);
+        init.credentials(value.credentials);
+        init.integrity(&value.integrity);
+        init.mode(value.mode);
+        init.redirect(value.redirect);
+        init.referrer(&value.referrer);
+        init.referrer_policy(value.referrer_policy);
+
+        init
+    }
+}
+
+/// A convenient builder for [`Request`].
+#[derive(Debug)]
+#[must_use = "RequestBuilder does nothing unless you assign a body or call `build`"]
 pub struct RequestBuilder {
-    options: web_sys::RequestInit,
-    headers: Headers,
-    query: QueryParams,
-    url: String,
+    // url
+    url: Url,
+    init: RequestInit,
+}
+
+/// A wrapper around [`web_sys::Request`].
+#[derive(Debug)]
+pub struct Request {
+    url: Url,
+    init: RequestInit,
+}
+
+/// A macro to generate "method" and "try_method" functions for [`RequestBuilder`].
+macro_rules! gen_method {
+    ($method:ident) => {
+        paste::item! {
+            #[doc = "Create a new [`RequestBuilder`] from a [`url::Url`]."]
+            #[doc = ""]
+            #[doc = concat!("# Note\n\nThis function is equivalent to [`RequestBuilder::new(http::Method::", stringify!($name), ", url)`].")]
+            #[inline]
+            pub fn [<$method:lower>](url: ::url::Url) -> $crate::http::RequestBuilder {
+                $crate::http::RequestBuilder::new(http::Method::[<$method:upper>], url)
+            }
+
+            #[doc = "Tries to create a new [`RequestBuilder`]."]
+            #[doc = ""]
+            #[doc = "# Errors\n\nThis function will return an error if URL parsing fails."]
+            #[doc = ""]
+            #[doc = concat!("# Note\n\nThis function is equivalent to [`RequestBuilder::try_new(http::Method::", stringify!($name), ", url)`].")]
+            #[inline]
+            pub fn [<try_ $method:lower>]<T>(url: T) -> Result<$crate::http::RequestBuilder, T::Error>
+            where
+                T: ::std::convert::TryInto<::url::Url>,
+            {
+                $crate::http::RequestBuilder::try_new(http::Method::[<$method:upper>], url)
+            }
+        }
+    };
 }
 
 impl RequestBuilder {
-    /// Creates a new request that will be sent to `url`.
-    ///
-    /// Uses `GET` by default. `url` can be a `String`, a `&str`, or a `Cow<'a, str>`.
-    pub fn new(url: &str) -> Self {
+    /// Create a new [`RequestBuilder`] from a [`http::Method`] and a [`url::Url`].
+    #[inline]
+    pub fn new(method: http::Method, url: url::Url) -> Self {
         Self {
-            options: web_sys::RequestInit::new(),
-            headers: Headers::new(),
-            query: QueryParams::new(),
-            url: url.into(),
+            url,
+            init: RequestInit {
+                method,
+                headers: http::HeaderMap::new(),
+                body: None,
+                cache: RequestCache::Default,
+                credentials: web_sys::RequestCredentials::Omit,
+                integrity: String::default(),
+                mode: web_sys::RequestMode::Cors,
+                redirect: web_sys::RequestRedirect::Follow,
+                referrer: String::from("about:client"),
+                referrer_policy: web_sys::ReferrerPolicy::None,
+            },
         }
     }
 
-    /// Set the body for this request.
-    pub fn body(mut self, body: impl Into<JsValue>) -> Result<Request, Error> {
-        self.options.body(Some(&body.into()));
-
-        self.try_into()
-    }
-
-    /// A string indicating how the request will interact with the browser’s HTTP cache.
-    pub fn cache(mut self, cache: RequestCache) -> Self {
-        self.options.cache(cache);
-        self
-    }
-
-    /// Controls what browsers do with credentials (cookies, HTTP authentication entries, and TLS
-    /// client certificates).
-    pub fn credentials(mut self, credentials: RequestCredentials) -> Self {
-        self.options.credentials(credentials);
-        self
-    }
-
-    /// Replace _all_ the headers.
-    pub fn headers(mut self, headers: Headers) -> Self {
-        self.headers = headers;
-        self
-    }
-
-    /// Sets a header.
-    pub fn header(self, key: &str, value: &str) -> Self {
-        self.headers.set(key, value);
-        self
-    }
-
-    /// Append query parameters to the url, given as `(name, value)` tuples. Values can be of any
-    /// type that implements [`ToString`].
+    /// Tries to create a new [`RequestBuilder`].
     ///
-    /// It is possible to append the same parameters with the same name multiple times, so
-    /// `.query([("a", "1"), ("a", "2")])` results in the query string `a=1&a=2`.
+    /// # Errors
     ///
-    /// # Examples
-    ///
-    /// The query parameters can be passed in various different forms:
-    ///
-    /// ```
-    /// # fn no_run() {
-    /// use std::collections::HashMap;
-    /// use gloo_net::http::Request;
-    ///
-    /// let slice_params = [("key", "value")];
-    /// let vec_params = vec![("a", "3"), ("b", "4")];
-    /// let mut map_params: HashMap<&'static str, &'static str> = HashMap::new();
-    /// map_params.insert("key", "another_value");
-    ///
-    /// let r = Request::get("/search")
-    ///     .query(slice_params)
-    ///     .query(vec_params)
-    ///     .query(map_params);
-    /// // Result URL: /search?key=value&a=3&b=4&key=another_value
-    /// # }
-    /// ```
-    pub fn query<'a, T, V>(self, params: T) -> Self
+    /// This function will return if URL parsing fails.
+    #[inline]
+    pub fn try_new<T>(method: http::Method, url: T) -> Result<Self, T::Error>
     where
-        T: IntoIterator<Item = (&'a str, V)>,
-        V: AsRef<str>,
+        T: TryInto<url::Url>,
     {
-        for (name, value) in params {
-            self.query.append(name, value.as_ref());
-        }
+        Ok(Self::new(method, url.try_into()?))
+    }
+
+    gen_method!(get);
+    gen_method!(post);
+    gen_method!(put);
+    gen_method!(delete);
+    gen_method!(head);
+    gen_method!(options);
+    gen_method!(connect);
+    gen_method!(patch);
+    gen_method!(trace);
+
+    /// Set the [`http::HeaderMap`] of the [`Request`].
+    #[inline]
+    pub fn headers(mut self, headers: impl Iterator<Item = (HeaderName, HeaderValue)>) -> Self {
+        self.init.headers = headers.collect();
         self
     }
 
-    /// The subresource integrity value of the request (e.g.,
-    /// `sha256-BpfBw7ivV8q2jLiT13fxDYAe2tJllusRSZ273h2nFSE=`).
-    pub fn integrity(mut self, integrity: &str) -> Self {
-        self.options.integrity(integrity);
-        self
-    }
-
-    /// A convenience method to set JSON as request body
+    /// Sets a single header of the [`Request`].
     ///
     /// # Note
     ///
-    /// This method also sets the `Content-Type` header to `application/json`
+    /// This will overwrite any existing header with the same name.
+    #[inline]
+    pub fn header(mut self, name: &HeaderName, value: impl Into<HeaderValue>) -> Self {
+        self.init.headers.insert(name, value.into());
+        self
+    }
+
+    /// Tries to set a single header of the [`Request`].
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the header key or value is invalid.
+    #[inline]
+    pub fn try_header(
+        mut self,
+        name: &HeaderName,
+        value: impl TryInto<HeaderValue, Error = InvalidHeaderValue>,
+    ) -> Result<Self, InvalidHeaderValue> {
+        self.init.headers.insert(name, value.try_into()?);
+        Ok(self)
+    }
+
+    /// Sets a single header of the [`Request`]. Panics if the header key or value is invalid.
+    #[inline]
+    pub fn try_header_unchecked(
+        mut self,
+        name: &HeaderName,
+        value: impl TryInto<HeaderValue, Error = InvalidHeaderValue>,
+    ) -> Self {
+        self.init.headers.insert(name, value.try_into().unwrap());
+        self
+    }
+
+    // skip body
+
+    /// Set the [`web_sys::RequestCache`] of the [`Request`].
+    ///
+    /// [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/API/Request/cache)
+    ///
+    /// # Note
+    ///
+    /// This is set to [`web_sys::RequestCache::Default`] by default.
+    #[inline]
+    pub fn cache(mut self, cache: web_sys::RequestCache) -> Self {
+        self.init.cache = cache;
+        self
+    }
+
+    /// Set the [`web_sys::RequestCredentials`] of the [`Request`].
+    ///
+    /// [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/API/Request/credentials)
+    ///
+    /// # Note
+    ///
+    /// This is set to [`web_sys::RequestCredentials::Omit`] by default.
+    #[inline]
+    pub fn credentials(mut self, credentials: web_sys::RequestCredentials) -> Self {
+        self.init.credentials = credentials;
+        self
+    }
+
+    /// Set the [subresource integrity](https://developer.mozilla.org/en-US/docs/Web/Security/Subresource_Integrity) value of the [`Request`].
+    ///
+    /// [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/API/Request/integrity)
+    #[inline]
+    pub fn integrity(mut self, integrity: impl Into<String>) -> Self {
+        self.init.integrity = integrity.into();
+        self
+    }
+
+    /// Set the [`web_sys::RequestMode`] of the [`Request`].
+    ///
+    /// [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/API/Request/mode)
+    ///
+    /// # Note
+    ///
+    /// This is set to [`web_sys::RequestMode::Cors`] by default.
+    #[inline]
+    pub fn mode(mut self, mode: web_sys::RequestMode) -> Self {
+        self.init.mode = mode;
+        self
+    }
+
+    /// Set the [`web_sys::RequestRedirect`] of the [`Request`].
+    ///
+    /// [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/API/Request/redirect)
+    ///
+    /// # Note
+    ///
+    /// This is set to [`web_sys::RequestRedirect::Follow`] by default.
+    #[inline]
+    pub fn redirect(mut self, redirect: web_sys::RequestRedirect) -> Self {
+        self.init.redirect = redirect;
+        self
+    }
+
+    /// Set the referrer of the [`Request`].
+    ///
+    /// [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/API/Request/referrer)
+    ///
+    /// # Note
+    ///
+    /// This is set to `"about:client"` by default.
+    #[inline]
+    pub fn referrer(mut self, referrer: impl Into<String>) -> Self {
+        self.init.referrer = referrer.into();
+        self
+    }
+
+    /// Set the [`web_sys::ReferrerPolicy`] of the [`Request`].
+    ///
+    /// [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/API/Request/referrerPolicy)
+    ///
+    /// # Note
+    ///
+    /// This is set to [`web_sys::ReferrerPolicy::None`] by default.
+    #[inline]
+    pub fn referrer_policy(mut self, referrer_policy: web_sys::ReferrerPolicy) -> Self {
+        self.init.referrer_policy = referrer_policy;
+        self
+    }
+
+    // TODO: skip signals for now
+
+    /// Build the [`Request`] with an empty body.
+    #[inline]
+    pub fn build(self) -> Request {
+        Request {
+            url: self.url,
+            init: self.init,
+        }
+    }
+
+    /// Build the [`Request`] with a body.
+    #[inline]
+    pub fn body(self, body: impl Into<Body>) -> Request {
+        Request {
+            url: self.url,
+            init: RequestInit {
+                body: Some(body.into()),
+                ..self.init
+            },
+        }
+    }
+
+    /// Build the [`Request`] with a text body.
+    #[inline]
+    pub fn text(self, text: impl Into<String>) -> Request {
+        self.body(Body::Text(text.into()))
+    }
+
+    /// Build the [`Request`] with a JSON body.
+    /// Requires the `json` feature.
     #[cfg(feature = "json")]
     #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
-    pub fn json<T: serde::Serialize + ?Sized>(self, value: &T) -> Result<Request, Error> {
+    #[inline]
+    pub fn json<T: serde::Serialize>(self, value: &T) -> Result<Request, Error> {
         let json = serde_json::to_string(value)?;
-        self.header("Content-Type", "application/json").body(json)
+        Ok(self.text(json))
     }
 
-    /// The request method, e.g., GET, POST.
-    pub fn method(mut self, method: Method) -> Self {
-        self.options.method(method.as_ref());
-        self
-    }
-
-    /// The mode you want to use for the request.
-    pub fn mode(mut self, mode: RequestMode) -> Self {
-        self.options.mode(mode);
-        self
-    }
-
-    /// Sets the observer callback.
-    pub fn observe(mut self, observe: &ObserverCallback) -> Self {
-        self.options.observe(observe);
-        self
-    }
-
-    /// How to handle a redirect response:
-    ///
-    /// - *follow*: Automatically follow redirects. Unless otherwise stated the redirect mode is
-    ///   set to follow
-    /// - *error*: Abort with an error if a redirect occurs.
-    /// - *manual*: Caller intends to process the response in another context. See [WHATWG fetch
-    ///   standard](https://fetch.spec.whatwg.org/#requests) for more information.
-    pub fn redirect(mut self, redirect: RequestRedirect) -> Self {
-        self.options.redirect(redirect);
-        self
-    }
-
-    /// The referrer of the request.
-    ///
-    /// This can be a same-origin URL, `about:client`, or an empty string.
-    pub fn referrer(mut self, referrer: &str) -> Self {
-        self.options.referrer(referrer);
-        self
-    }
-
-    /// Specifies the
-    /// [referrer policy](https://w3c.github.io/webappsec-referrer-policy/#referrer-policies) to
-    /// use for the request.
-    pub fn referrer_policy(mut self, referrer_policy: ReferrerPolicy) -> Self {
-        self.options.referrer_policy(referrer_policy);
-        self
-    }
-
-    /// Sets the request abort signal.
-    pub fn abort_signal(mut self, signal: Option<&AbortSignal>) -> Self {
-        self.options.signal(signal);
-        self
-    }
-    /// Builds the request and send it to the server, returning the received response.
+    /// Build and Send the [`Request`] using the `fetch` API.
     pub async fn send(self) -> Result<Response, Error> {
-        let req: Request = self.try_into()?;
-        req.send().await
-    }
-    /// Builds the request.
-    pub fn build(self) -> Result<Request, crate::error::Error> {
-        self.try_into()
+        self.build().send().await
     }
 }
 
-impl TryFrom<RequestBuilder> for Request {
-    type Error = crate::error::Error;
+// Getters into RequestInit
+impl Request {
+    gen_method!(get);
+    gen_method!(post);
+    gen_method!(put);
+    gen_method!(delete);
+    gen_method!(head);
+    gen_method!(options);
+    gen_method!(connect);
+    gen_method!(patch);
+    gen_method!(trace);
 
-    fn try_from(mut value: RequestBuilder) -> Result<Self, Self::Error> {
-        // To preserve existing query parameters of self.url, it must be parsed and extended with
-        // self.query's parameters. As web_sys::Url just accepts absolute URLs, retrieve the
-        // absolute URL through creating a web_sys::Request object.
-        let request = web_sys::Request::new_with_str(&value.url).map_err(js_to_error)?;
-        let url = web_sys::Url::new(&request.url()).map_err(js_to_error)?;
-        let combined_query = match url.search().as_str() {
-            "" => value.query.to_string(),
-            _ => format!("{}&{}", url.search(), value.query),
-        };
-        url.set_search(&combined_query);
+    /// Get the [`http::Method`] of the [`Request`].
+    #[inline]
+    pub fn method(&self) -> &http::Method {
+        &self.init.method
+    }
 
-        let final_url = String::from(url.to_string());
-        value.options.headers(&value.headers.into_raw());
-        let request = web_sys::Request::new_with_str_and_init(&final_url, &value.options)
+    /// Get the [`http::HeaderMap`] of the [`Request`].
+    #[inline]
+    pub fn headers(&self) -> &http::HeaderMap {
+        &self.init.headers
+    }
+
+    /// Get the [`web_sys::RequestCache`] of the [`Request`].
+    #[inline]
+    pub fn cache(&self) -> web_sys::RequestCache {
+        self.init.cache
+    }
+
+    /// Get the [`web_sys::RequestCredentials`] of the [`Request`].
+    #[inline]
+    pub fn credentials(&self) -> web_sys::RequestCredentials {
+        self.init.credentials
+    }
+
+    /// Get the [subresource integrity](https://developer.mozilla.org/en-US/docs/Web/Security/Subresource_Integrity) value of the [`Request`].
+    #[inline]
+    pub fn integrity(&self) -> &String {
+        &self.init.integrity
+    }
+
+    /// Get the [`web_sys::RequestMode`] of the [`Request`].
+    #[inline]
+    pub fn mode(&self) -> web_sys::RequestMode {
+        self.init.mode
+    }
+
+    /// Get the [`web_sys::RequestRedirect`] of the [`Request`].
+    #[inline]
+    pub fn redirect(&self) -> web_sys::RequestRedirect {
+        self.init.redirect
+    }
+
+    /// Get the referrer of the [`Request`].
+    #[inline]
+    pub fn referrer(&self) -> &String {
+        &self.init.referrer
+    }
+
+    /// Get the [`web_sys::ReferrerPolicy`] of the [`Request`].
+    #[inline]
+    pub fn referrer_policy(&self) -> web_sys::ReferrerPolicy {
+        self.init.referrer_policy
+    }
+
+    // TODO: skip signals for now
+
+    /// Get the [`url::Url`] of the [`Request`].
+    #[inline]
+    pub fn url(&self) -> &url::Url {
+        &self.url
+    }
+
+    /// Sends the [`Request`] using the `fetch` API.
+    pub async fn send(self) -> Result<Response, Error> {
+        let request = web_sys::Request::new_with_str_and_init(self.url.as_str(), &self.init.into())
             .map_err(js_to_error)?;
 
-        Ok(request.into())
-    }
-}
+        let resp = wasm_bindgen_futures::JsFuture::from(
+            web_sys::window().unwrap().fetch_with_request(&request),
+        )
+        .await
+        .map_err(js_to_error)?;
 
-impl fmt::Debug for RequestBuilder {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Request").field("url", &self.url).finish()
-    }
-}
-
-/// The [`Request`] sent to the server
-pub struct Request(web_sys::Request);
-
-impl Request {
-    /// Creates a new [`GET`][Method::GET] `Request` with url.
-    pub fn get(url: &str) -> RequestBuilder {
-        RequestBuilder::new(url).method(Method::GET)
-    }
-
-    /// Creates a new [`POST`][Method::POST] `Request` with url.
-    pub fn post(url: &str) -> RequestBuilder {
-        RequestBuilder::new(url).method(Method::POST)
-    }
-
-    /// Creates a new [`PUT`][Method::PUT] `Request` with url.
-    pub fn put(url: &str) -> RequestBuilder {
-        RequestBuilder::new(url).method(Method::PUT)
-    }
-
-    /// Creates a new [`DELETE`][Method::DELETE] `Request` with url.
-    pub fn delete(url: &str) -> RequestBuilder {
-        RequestBuilder::new(url).method(Method::DELETE)
-    }
-
-    /// Creates a new [`PATCH`][Method::PATCH] `Request` with url.
-    pub fn patch(url: &str) -> RequestBuilder {
-        RequestBuilder::new(url).method(Method::PATCH)
-    }
-
-    /// The URL of the request.
-    pub fn url(&self) -> String {
-        self.0.url()
-    }
-
-    /// Gets the headers.
-    pub fn headers(&self) -> Headers {
-        Headers::from_raw(self.0.headers())
-    }
-
-    /// Has the request body been consumed?
-    ///
-    /// If true, then any future attempts to consume the body will error.
-    pub fn body_used(&self) -> bool {
-        self.0.body_used()
-    }
-
-    /// Gets the body.
-    pub fn body(&self) -> Option<ReadableStream> {
-        self.0.body()
-    }
-
-    /// Reads the request to completion, returning it as `FormData`.
-    pub async fn form_data(&self) -> Result<FormData, Error> {
-        let promise = self.0.form_data().map_err(js_to_error)?;
-        let val = JsFuture::from(promise).await.map_err(js_to_error)?;
-        Ok(FormData::from(val))
-    }
-
-    /// Reads the request to completion, parsing it as JSON.
-    #[cfg(feature = "json")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
-    pub async fn json<T: DeserializeOwned>(&self) -> Result<T, Error> {
-        serde_json::from_str::<T>(&self.text().await?).map_err(Error::from)
-    }
-
-    /// Reads the reqeust as a String.
-    pub async fn text(&self) -> Result<String, Error> {
-        let promise = self.0.text().unwrap();
-        let val = JsFuture::from(promise).await.map_err(js_to_error)?;
-        let string = js_sys::JsString::from(val);
-        Ok(String::from(&string))
-    }
-
-    /// Gets the binary request
-    ///
-    /// This works by obtaining the response as an `ArrayBuffer`, creating a `Uint8Array` from it
-    /// and then converting it to `Vec<u8>`
-    pub async fn binary(&self) -> Result<Vec<u8>, Error> {
-        let promise = self.0.array_buffer().map_err(js_to_error)?;
-        let array_buffer: ArrayBuffer = JsFuture::from(promise)
-            .await
-            .map_err(js_to_error)?
-            .unchecked_into();
-        let typed_buff: Uint8Array = Uint8Array::new(&array_buffer);
-        let mut body = vec![0; typed_buff.length() as usize];
-        typed_buff.copy_to(&mut body);
-        Ok(body)
-    }
-
-    /// Return the read only mode for the request
-    pub fn mode(&self) -> RequestMode {
-        self.0.mode()
-    }
-
-    /// Return the parsed method for the request
-    pub fn method(&self) -> Method {
-        Method::from_str(self.0.method().as_str()).unwrap()
-    }
-
-    /// Executes the request.
-    pub async fn send(self) -> Result<Response, Error> {
-        let request = self.0;
-        let global = js_sys::global();
-        let maybe_window =
-            Reflect::get(&global, &JsValue::from_str("Window")).map_err(js_to_error)?;
-        let promise = if !maybe_window.is_undefined() {
-            let window = global.dyn_into::<web_sys::Window>().unwrap();
-            window.fetch_with_request(&request)
-        } else {
-            let maybe_worker = Reflect::get(&global, &JsValue::from_str("WorkerGlobalScope"))
-                .map_err(js_to_error)?;
-            if !maybe_worker.is_undefined() {
-                let worker = global.dyn_into::<web_sys::WorkerGlobalScope>().unwrap();
-                worker.fetch_with_request(&request)
-            } else {
-                panic!("Unsupported JavaScript global context");
-            }
-        };
-
-        let response = JsFuture::from(promise).await.map_err(js_to_error)?;
-        response
-            .dyn_into::<web_sys::Response>()
-            .map_err(|e| panic!("fetch returned {:?}, not `Response` - this is a bug", e))
-            .map(Response::from)
+        Ok(Response::from(
+            resp.dyn_into::<web_sys::Response>().unwrap(),
+        ))
     }
 }
 
 impl From<web_sys::Request> for Request {
-    fn from(raw: web_sys::Request) -> Self {
-        Request(raw)
-    }
-}
-
-impl From<Request> for web_sys::Request {
-    fn from(val: Request) -> Self {
-        val.0
-    }
-}
-
-impl fmt::Debug for Request {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Request")
-            .field("url", &self.url())
-            .field("headers", &self.headers())
-            .field("body_used", &self.body_used())
-            .finish()
+    fn from(value: web_sys::Request) -> Self {
+        Self {
+            url: Url::parse(&value.url()).unwrap(),
+            init: RequestInit {
+                method: http::Method::from_bytes(value.method().as_bytes()).unwrap(),
+                headers: headers_from_js(value.headers()),
+                body: value.body().map(Body::from),
+                cache: value.cache(),
+                credentials: value.credentials(),
+                integrity: value.integrity(),
+                mode: value.mode(),
+                redirect: value.redirect(),
+                referrer: value.referrer(),
+                referrer_policy: value.referrer_policy(),
+            },
+        }
     }
 }

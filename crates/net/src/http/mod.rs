@@ -13,15 +13,14 @@
 //! # }
 //! ```
 
-mod headers;
-mod query;
+#[macro_use]
 mod request;
+mod body;
+mod headers;
 mod response;
 
-pub use headers::Headers;
 #[doc(inline)]
 pub use http::Method;
-pub use query::QueryParams;
 
-pub use request::Request;
-pub use response::{IntoRawResponse, Response};
+pub use request::{Request, RequestBuilder};
+pub use response::{Response, ResponseBuilder};

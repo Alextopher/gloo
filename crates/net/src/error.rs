@@ -1,6 +1,9 @@
 use gloo_utils::errors::JsError;
 use thiserror::Error as ThisError;
 
+/// A specialized [`Result`] type for this crate's operations.
+pub type Result<T> = std::result::Result<T, Error>;
+
 /// All the errors returned by this crate.
 #[derive(Debug, ThisError)]
 pub enum Error {
