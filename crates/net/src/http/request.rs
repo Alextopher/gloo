@@ -1,7 +1,6 @@
 use std::convert::TryInto;
 
 use http::{header::InvalidHeaderValue, HeaderName, HeaderValue};
-use url::Url;
 use wasm_bindgen::JsCast;
 use web_sys::RequestCache;
 
@@ -55,14 +54,14 @@ impl From<RequestInit> for web_sys::RequestInit {
 #[must_use = "RequestBuilder does nothing unless you assign a body or call `build`"]
 pub struct RequestBuilder {
     // url
-    url: Url,
+    url: String,
     init: RequestInit,
 }
 
 /// A wrapper around [`web_sys::Request`].
 #[derive(Debug)]
 pub struct Request {
-    url: Url,
+    url: String,
     init: RequestInit,
 }
 
@@ -74,30 +73,30 @@ macro_rules! gen_method {
             #[doc = ""]
             #[doc = concat!("# Note\n\nThis function is equivalent to [`RequestBuilder::new(http::Method::", stringify!($name), ", url)`].")]
             #[inline]
-            pub fn [<$method:lower>](url: ::url::Url) -> $crate::http::RequestBuilder {
+            pub fn [<$method:lower>](url: ::std::string::String) -> $crate::http::RequestBuilder {
                 $crate::http::RequestBuilder::new(http::Method::[<$method:upper>], url)
             }
 
-            #[doc = "Tries to create a new [`RequestBuilder`]."]
-            #[doc = ""]
-            #[doc = "# Errors\n\nThis function will return an error if URL parsing fails."]
-            #[doc = ""]
-            #[doc = concat!("# Note\n\nThis function is equivalent to [`RequestBuilder::try_new(http::Method::", stringify!($name), ", url)`].")]
-            #[inline]
-            pub fn [<try_ $method:lower>]<T>(url: T) -> Result<$crate::http::RequestBuilder, T::Error>
-            where
-                T: ::std::convert::TryInto<::url::Url>,
-            {
-                $crate::http::RequestBuilder::try_new(http::Method::[<$method:upper>], url)
-            }
+            // #[doc = "Tries to create a new [`RequestBuilder`]."]
+            // #[doc = ""]
+            // #[doc = "# Errors\n\nThis function will return an error if URL parsing fails."]
+            // #[doc = ""]
+            // #[doc = concat!("# Note\n\nThis function is equivalent to [`RequestBuilder::try_new(http::Method::", stringify!($name), ", url)`].")]
+            // #[inline]
+            // pub fn [<try_ $method:lower>]<T>(url: T) -> Result<$crate::http::RequestBuilder, T::Error>
+            // where
+            //     T: ::std::convert::TryInto<::url::Url>,
+            // {
+            //     $crate::http::RequestBuilder::try_new(http::Method::[<$method:upper>], url)
+            // }
         }
     };
 }
 
 impl RequestBuilder {
-    /// Create a new [`RequestBuilder`] from a [`http::Method`] and a [`url::Url`].
+    /// Create a new [`RequestBuilder`] from a [`http::Method`] and a url.
     #[inline]
-    pub fn new(method: http::Method, url: url::Url) -> Self {
+    pub fn new(method: http::Method, url: String) -> Self {
         Self {
             url,
             init: RequestInit {
@@ -115,18 +114,18 @@ impl RequestBuilder {
         }
     }
 
-    /// Tries to create a new [`RequestBuilder`].
-    ///
-    /// # Errors
-    ///
-    /// This function will return if URL parsing fails.
-    #[inline]
-    pub fn try_new<T>(method: http::Method, url: T) -> Result<Self, T::Error>
-    where
-        T: TryInto<url::Url>,
-    {
-        Ok(Self::new(method, url.try_into()?))
-    }
+    // Tries to create a new [`RequestBuilder`].
+    //
+    // # Errors
+    //
+    // This function will return if URL parsing fails.
+    // #[inline]
+    // pub fn try_new<T>(method: http::Method, url: T) -> Result<Self, T::Error>
+    // where
+    //     T: TryInto<url::Url>,
+    // {
+    //     Ok(Self::new(method, url.try_into()?))
+    // }
 
     gen_method!(get);
     gen_method!(post);
@@ -386,7 +385,7 @@ impl Request {
 
     /// Get the [`url::Url`] of the [`Request`].
     #[inline]
-    pub fn url(&self) -> &url::Url {
+    pub fn url(&self) -> &String {
         &self.url
     }
 
@@ -410,7 +409,7 @@ impl Request {
 impl From<web_sys::Request> for Request {
     fn from(value: web_sys::Request) -> Self {
         Self {
-            url: Url::parse(&value.url()).unwrap(),
+            url: value.url(),
             init: RequestInit {
                 method: http::Method::from_bytes(value.method().as_bytes()).unwrap(),
                 headers: headers_from_js(value.headers()),

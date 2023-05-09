@@ -96,11 +96,6 @@ impl Response {
         ResponseBuilder::new(status_code)
     }
 
-    /// Returns the [`Body`] of the [`Response`].
-    pub fn body(&self) -> Option<&Body> {
-        self.body.as_ref()
-    }
-
     /// Returns the [`http::HeaderMap`] of the [`Response`].
     pub fn headers(&self) -> &http::HeaderMap {
         &self.init.headers
@@ -114,6 +109,11 @@ impl Response {
     /// Returns the status text of the [`Response`].
     pub fn status_text(&self) -> &str {
         &self.init.status_text
+    }
+
+    /// Returns the [`Body`] of the [`Response`].
+    pub fn body(&self) -> Option<&Body> {
+        self.body.as_ref()
     }
 }
 
