@@ -13,6 +13,7 @@ use web_sys::ReadableStream;
 pub enum Body {
     Text(String),
     ReadableStream(web_sys::ReadableStream),
+    // TODO: Add support for the other types.
 }
 
 impl From<ReadableStream> for Body {

@@ -5,6 +5,7 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use js_sys::{Array, Map};
 use wasm_bindgen::JsCast;
 
+/// Converts a [`http::HeaderMap`] to a [`web_sys::Headers`].
 pub(crate) fn headers_to_js(headers: &HeaderMap) -> web_sys::Headers {
     let js_headers = web_sys::Headers::new().unwrap();
     for (name, value) in headers {
@@ -15,7 +16,8 @@ pub(crate) fn headers_to_js(headers: &HeaderMap) -> web_sys::Headers {
     js_headers
 }
 
-pub(crate) fn headers_from_js(headers: web_sys::Headers) -> HeaderMap {
+/// Converts a [`web_sys::Headers`] to a [`http::HeaderMap`].
+pub(crate) fn headers_from_js(headers: &web_sys::Headers) -> HeaderMap {
     // Here we cheat and cast to a map even though `self` isn't, because the method names match
     // and everything works. Is there a better way? Should there be a `MapLike` or
     // `MapIterator` type in `js_sys`?

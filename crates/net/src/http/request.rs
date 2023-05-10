@@ -2,7 +2,7 @@ use std::convert::TryInto;
 
 use http::{header::InvalidHeaderValue, HeaderName, HeaderValue};
 use wasm_bindgen::JsCast;
-use web_sys::RequestCache;
+use web_sys::{ReadableStream, RequestCache};
 
 use crate::{js_to_error, Error};
 
@@ -12,13 +12,11 @@ use super::{
     Response,
 };
 
-/// RequestInit caches the data used to initialize a [`web_sys::Request`].
-///
-/// It implements [`From<RequestInit>`] to allow for easy conversion to [`web_sys::RequestInit`].
+/// RequestOptions is used to create a [`web_sys::RequestInit`].
 #[derive(Debug)]
-struct RequestInit {
+struct RequestOptions {
     method: http::Method,
-    headers: http::HeaderMap,
+    headers: http::HeaderMap, // or our current `Headers` type
     body: Option<Body>,
     cache: web_sys::RequestCache,
     credentials: web_sys::RequestCredentials,
@@ -27,11 +25,11 @@ struct RequestInit {
     redirect: web_sys::RequestRedirect,
     referrer: String,
     referrer_policy: web_sys::ReferrerPolicy,
-    // pub(crate) signal: Option<&'a web_sys::AbortSignal>,
+    // signal: Option<&'a web_sys::AbortSignal>,
 }
 
-impl From<RequestInit> for web_sys::RequestInit {
-    fn from(value: RequestInit) -> Self {
+impl From<RequestOptions> for web_sys::RequestInit {
+    fn from(value: RequestOptions) -> Self {
         let mut init = web_sys::RequestInit::new();
 
         init.method(value.method.as_str());
@@ -55,21 +53,14 @@ impl From<RequestInit> for web_sys::RequestInit {
 pub struct RequestBuilder {
     // url
     url: String,
-    init: RequestInit,
-}
-
-/// A wrapper around [`web_sys::Request`].
-#[derive(Debug)]
-pub struct Request {
-    url: String,
-    init: RequestInit,
+    init: RequestOptions,
 }
 
 /// A macro to generate "method" and "try_method" functions for [`RequestBuilder`].
 macro_rules! gen_method {
     ($method:ident) => {
         paste::item! {
-            #[doc = "Create a new [`RequestBuilder`] from a [`url::Url`]."]
+            #[doc = "Create a new [`RequestBuilder`] from a [`String`]."]
             #[doc = ""]
             #[doc = concat!("# Note\n\nThis function is equivalent to [`RequestBuilder::new(http::Method::", stringify!($name), ", url)`].")]
             #[inline]
@@ -99,7 +90,7 @@ impl RequestBuilder {
     pub fn new(method: http::Method, url: String) -> Self {
         Self {
             url,
-            init: RequestInit {
+            init: RequestOptions {
                 method,
                 headers: http::HeaderMap::new(),
                 body: None,
@@ -275,22 +266,16 @@ impl RequestBuilder {
     /// Build the [`Request`] with an empty body.
     #[inline]
     pub fn build(self) -> Request {
-        Request {
-            url: self.url,
-            init: self.init,
-        }
+        web_sys::Request::new_with_str_and_init(self.url.as_str(), &self.init.into())
+            .unwrap()
+            .into()
     }
 
     /// Build the [`Request`] with a body.
     #[inline]
-    pub fn body(self, body: impl Into<Body>) -> Request {
-        Request {
-            url: self.url,
-            init: RequestInit {
-                body: Some(body.into()),
-                ..self.init
-            },
-        }
+    pub fn body(mut self, body: impl Into<Body>) -> Request {
+        self.init.body = Some(body.into());
+        self.build()
     }
 
     /// Build the [`Request`] with a text body.
@@ -300,19 +285,32 @@ impl RequestBuilder {
     }
 
     /// Build the [`Request`] with a JSON body.
+    ///
     /// Requires the `json` feature.
+    ///
+    /// # Note
+    ///
+    /// This will set the `Content-Type` header to `application/json`.
     #[cfg(feature = "json")]
     #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
     #[inline]
-    pub fn json<T: serde::Serialize>(self, value: &T) -> Result<Request, Error> {
+    pub fn json(mut self, value: &impl serde::Serialize) -> Result<Request, Error> {
         let json = serde_json::to_string(value)?;
+        self.init.headers.insert(
+            http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
         Ok(self.text(json))
     }
+}
 
-    /// Build and Send the [`Request`] using the `fetch` API.
-    pub async fn send(self) -> Result<Response, Error> {
-        self.build().send().await
-    }
+/// A wrapper around [`web_sys::Request`]. Requests are immutable after they are created.
+#[derive(Debug)]
+pub struct Request {
+    inner: web_sys::Request,
+    // Cached Rust representations of the request inners.
+    url: String,
+    init: RequestOptions,
 }
 
 // Getters into RequestInit
@@ -381,15 +379,44 @@ impl Request {
         self.init.referrer_policy
     }
 
-    // TODO: skip signals for now
-
-    /// Get the [`url::Url`] of the [`Request`].
+    /// Get the URL of the [`Request`].
     #[inline]
     pub fn url(&self) -> &String {
         &self.url
     }
 
+    // TODO: skip signals for now
+
+    /// Get the body of the [`Request`] as a [`ReadableStream`].
+    #[inline]
+    pub fn body(&self) -> Option<ReadableStream> {
+        self.inner.body()
+    }
+
+    /// Get the body of the [`Request`] as text.
+    #[inline]
+    pub async fn text(&self) -> Result<String, Error> {
+        let promise = self.inner.text().map_err(js_to_error)?;
+
+        Ok(wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(js_to_error)?
+            .as_string()
+            .unwrap())
+    }
+
+    /// Get the body of the [`Request`] as parsed JSON.
+    /// Requires the `json` feature.
+    #[cfg(feature = "json")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
+    #[inline]
+    pub async fn json<T: serde::de::DeserializeOwned>(&self) -> crate::Result<T> {
+        let text = self.text().await?;
+        Ok(serde_json::from_str(&text)?)
+    }
+
     /// Sends the [`Request`] using the `fetch` API.
+    #[inline]
     pub async fn send(self) -> Result<Response, Error> {
         let request = web_sys::Request::new_with_str_and_init(self.url.as_str(), &self.init.into())
             .map_err(js_to_error)?;
@@ -400,7 +427,7 @@ impl Request {
         .await
         .map_err(js_to_error)?;
 
-        Ok(Response::from(
+        Ok(Response::from_raw(
             resp.dyn_into::<web_sys::Response>().unwrap(),
         ))
     }
@@ -410,9 +437,9 @@ impl From<web_sys::Request> for Request {
     fn from(value: web_sys::Request) -> Self {
         Self {
             url: value.url(),
-            init: RequestInit {
+            init: RequestOptions {
                 method: http::Method::from_bytes(value.method().as_bytes()).unwrap(),
-                headers: headers_from_js(value.headers()),
+                headers: headers_from_js(&value.headers()),
                 body: value.body().map(Body::from),
                 cache: value.cache(),
                 credentials: value.credentials(),
@@ -422,6 +449,7 @@ impl From<web_sys::Request> for Request {
                 referrer: value.referrer(),
                 referrer_policy: value.referrer_policy(),
             },
+            inner: value,
         }
     }
 }
